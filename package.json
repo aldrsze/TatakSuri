@@ -11,12 +11,14 @@
   },
   "dependencies": {
     "@mlc-ai/web-llm": "^0.2.85",
+    "@tailwindcss/cli": "^4.3.3",
     "idb": "^8.0.4",
     "jszip": "^3.10.2",
     "mammoth": "^1.13.0",
     "pdfjs-dist": "^6.4.299",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "tailwindcss": "^4.3.3"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",

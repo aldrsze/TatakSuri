@@ -41,7 +41,7 @@ function buildDocument(
     );
   }
 
-  return { ...meta, text, pages: cleaned };
+  return { ...meta, text, pages: cleaned, warnings };
 }
 
 export async function extractFromFile(

@@ -20,6 +20,8 @@ export type { ChatCompletionMessageParam };
 // IDs must exist in WebLLM's prebuilt list; getAvailableModels() filters out
 // any that your installed web-llm version doesn't ship.
 export const MODEL_OPTIONS = [
+  { id: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', label: 'Tiny (Qwen 2.5 0.5B)' },
+  { id: 'Llama-3.2-1B-Instruct-q4f32_1-MLC', label: 'Fast, compatible (Llama 3.2 1B, f32)' },
   { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', label: 'Fast (Llama 3.2 1B)' },
   { id: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', label: 'Balanced (Qwen 2.5 1.5B)' },
   { id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC', label: 'Better quality (Llama 3.2 3B)' },
@@ -103,6 +105,7 @@ export async function checkWebGpu(): Promise<{ ok: true } | { ok: false; reason:
 /* ----------------------------- Load / unload ----------------------------- */
 
 let engine: MLCEngineInterface | null = null;
+let worker: Worker | null = null;
 let loadedModelId: string | null = null;
 let loading: Promise<void> | null = null;
 
@@ -137,22 +140,30 @@ export async function loadModel(modelId: string = getSelectedModelId()): Promise
         engine.setInitProgressCallback(onProgress);
         await engine.reload(modelId); // switch models on the existing worker
       } else {
-        engine = await CreateWebWorkerMLCEngine(
-          new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' }),
-          modelId,
-          { initProgressCallback: onProgress },
-        );
+        worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+        engine = await CreateWebWorkerMLCEngine(worker, modelId, {
+          initProgressCallback: onProgress,
+        });
       }
 
       loadedModelId = modelId;
       setSelectedModelId(modelId);
       setStatus({ state: 'ready', modelId });
     } catch (err) {
-      if (status.state !== 'unsupported') {
-        setStatus({
-          state: 'error',
-          message: err instanceof Error ? err.message : 'Failed to load the AI model.',
-        });
+      if (isGpuLost(err)) {
+        markEngineLost();
+      } else {
+        // A failed first load leaves no usable engine, so drop the worker too
+        if (!engine && worker) {
+          worker.terminate();
+          worker = null;
+        }
+        if (status.state !== 'unsupported') {
+          setStatus({
+            state: 'error',
+            message: err instanceof Error ? err.message : 'Failed to load the AI model.',
+          });
+        }
       }
       throw err;
     } finally {
@@ -176,6 +187,27 @@ function requireEngine(): MLCEngineInterface {
     throw new Error('The AI model is not loaded yet. Call loadModel() first.');
   }
   return engine;
+}
+
+/* --------------------------- GPU loss recovery --------------------------- */
+
+// Windows can reset the GPU if one operation takes too long (DXGI_ERROR_DEVICE_HUNG),
+// or the browser can lose the device when memory runs out. The engine is dead after that.
+function isGpuLost(e: unknown) {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /device (was )?lost|DXGI|device hung|GPUDevice/i.test(msg);
+}
+
+function markEngineLost() {
+  worker?.terminate();
+  worker = null;
+  engine = null;
+  loadedModelId = null;
+  setStatus({
+    state: 'error',
+    message:
+      'The GPU stopped responding. Choose a smaller model and load it again. If it keeps happening, reload the page and close other GPU-heavy apps.',
+  });
 }
 
 /* ------------------------------ Generation ------------------------------ */
@@ -212,11 +244,11 @@ export function complete(opts: CompleteOptions): Promise<string> {
   return enqueue(async () => {
     const e = requireEngine();
     if (opts.signal?.aborted) throw abortError();
-    if (opts.resetChat !== false) await e.resetChat();
 
     const onAbort = () => e.interruptGenerate();
     opts.signal?.addEventListener('abort', onAbort);
     try {
+      if (opts.resetChat !== false) await e.resetChat();
       const reply = await e.chat.completions.create({
         messages: opts.messages,
         temperature: opts.temperature ?? 0.3,
@@ -226,6 +258,9 @@ export function complete(opts: CompleteOptions): Promise<string> {
       });
       if (opts.signal?.aborted) throw abortError();
       return reply.choices[0]?.message?.content ?? '';
+    } catch (err) {
+      if (isGpuLost(err)) markEngineLost();
+      throw err;
     } finally {
       opts.signal?.removeEventListener('abort', onAbort);
     }
@@ -264,6 +299,9 @@ export function streamChat(opts: StreamOptions): Promise<string> {
       }
       if (opts.signal?.aborted) throw abortError();
       return full;
+    } catch (err) {
+      if (isGpuLost(err)) markEngineLost();
+      throw err;
     } finally {
       opts.signal?.removeEventListener('abort', onAbort);
     }
